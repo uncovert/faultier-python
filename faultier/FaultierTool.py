@@ -253,6 +253,10 @@ def faultier_test(args=None):
         print("###############################")
 
 
+def faultier_bootloader(args=None):
+    faultier.Faultier().reboot_bootloader()
+    print("Faultier rebooted into the bootloader: copy the firmware .uf2 to the RPI-RP2 drive.")
+
 def faultier_visualize(args):
     print(f"Visualizing {args.file}")
     try:
@@ -296,6 +300,7 @@ def main():
 
     # Parse arguments and check for subcommand
     subparsers.add_parser("selfcheck", help="Run self test").set_defaults(func=faultier_test)
+    subparsers.add_parser("bootloader", help="Reboot into the USB bootloader for a firmware update").set_defaults(func=faultier_bootloader)
 
     visualize_parser = subparsers.add_parser("visualize", help="Visualize a glitching database")
     visualize_parser.set_defaults(func=faultier_visualize)

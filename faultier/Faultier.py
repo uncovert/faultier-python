@@ -516,6 +516,28 @@ class Faultier:
         response = self._check_response()
         return convert_uint8_samples(response.adc.samples)
 
+    @no_interrupt
+    def reboot_bootloader(self):
+        """
+        Reboots the Faultier into the RP2040 USB bootloader, as if BOOTSEL had
+        been held while plugging it in: it shows up as a USB drive (RPI-RP2)
+        that a firmware .uf2 can be copied to. This Faultier object cannot be
+        used afterwards.
+        """
+        cmd = Command()
+        cmd.reboot_bootloader.CopyFrom(CommandRebootBootloader())
+        self._send_protobuf(cmd)
+        try:
+            response = self._read_response(timeout=2000)
+        except usb.core.USBTimeoutError as e:
+            raise ValueError("No reply: this Faultier firmware cannot reboot into the bootloader. "
+                             "Hold BOOTSEL while plugging it in instead.") from e
+        resp = Response()
+        resp.ParseFromString(response)
+        if resp.WhichOneof('type') != 'ok':
+            raise ValueError(f"Unexpected reply: {resp}")
+        usb.util.dispose_resources(self.dev)
+
     # STM8 SWIM ---------------------------------------------------------------
 
     @no_interrupt

@@ -11,6 +11,7 @@ import struct
 
 import pytest
 import usb.core
+import usb.util
 
 import faultier
 from faultier.Faultier import Faultier, SWIMError, SWIM_MAX_READ, SWIM_MAX_WRITE, SWIM_REPLY_TIMEOUT_MS
@@ -67,6 +68,8 @@ class FakeFirmware:
                                                 supports_swim=self.supports_swim))
         if kind == "configure_adc":
             return Response(ok=ResponseOk())
+        if kind == "reboot_bootloader":
+            return Response(ok=ResponseOk()) if self.answer_swim else None
         if kind != "swim" or not self.answer_swim:
             return None                       # old firmware: "Invalid command!", no reply
         swim = cmd.swim
@@ -226,6 +229,25 @@ def test_bad_ranges_are_rejected_on_the_host():
     with pytest.raises(ValueError):
         ft.swim_write(0x1000000, b"\x00")
     assert [c.function for c in swim_commands(fw)] == [SWIM_ENTER]
+
+
+def test_reboot_bootloader(monkeypatch):
+    disposed = []
+    monkeypatch.setattr(usb.util, "dispose_resources", disposed.append)
+    fw = FakeFirmware()
+    ft = make_faultier(fw)
+    ft.dev = "device"
+    ft.reboot_bootloader()
+    assert fw.commands[-1].WhichOneof("cmd") == "reboot_bootloader"
+    assert disposed == ["device"]
+
+
+def test_reboot_bootloader_on_old_firmware_raises_instead_of_hanging():
+    fw = FakeFirmware(supports_swim=False, answer_swim=False)
+    ft = make_faultier(fw)
+    with pytest.raises(ValueError, match="BOOTSEL"):
+        ft.reboot_bootloader()
+    assert fw.read_timeouts[-1] == 2000
 
 
 def test_existing_commands_still_use_the_default_timeout():
