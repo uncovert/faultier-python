@@ -60,6 +60,20 @@ def convert_uint8_samples(input: bytes):
     for b in input:
         r.append(b/255)
     return r
+
+# Largest SWIM transfers the firmware takes per command; longer ones are split.
+SWIM_MAX_READ = 1024
+SWIM_MAX_WRITE = 128
+# The firmware answers every SWIM command within 1.5 s; this is the host's
+# backstop if it does not (device unplugged, or firmware without SWIM).
+SWIM_REPLY_TIMEOUT_MS = 5000
+
+class SWIMError(ValueError):
+    """
+    A SWIM operation failed: no target, entry not answered, target not
+    acknowledging, line problems, or a session that has not been entered.
+    The message comes from the Faultier firmware and says which.
+    """
 """
     This class is used to control the Faultier.
 
@@ -82,15 +96,17 @@ class Faultier:
     PID = 0xfffd
 
     _buffer = b""
+    supports_swim = False
+    swim_sync_ns = None
 
-    def _buffered_read(self, length):
+    def _buffered_read(self, length, timeout=None):
         while True:
             if len(self._buffer) >= length:
                 ret = self._buffer[:length]
                 self._buffer = self._buffer[length:]
                 return ret
 
-            self._buffer += bytes(self.ep_in.read(64))
+            self._buffer += bytes(self.ep_in.read(64, timeout))
 
     @no_interrupt
     def _send_hello(self):
@@ -103,6 +119,8 @@ class Faultier:
         if response.hello.version != FAULTIER_VERSION:
             usb.util.dispose_resources(self.dev)
             raise ValueError(f"Invalid Faultier version: Locally: {FAULTIER_VERSION} - Device: {response.hello.version}")
+        # Firmware without SWIM leaves this unset (and ignores SWIM commands).
+        self.supports_swim = response.hello.supports_swim
         
 
     def __init__(self, path = None):
@@ -201,13 +219,13 @@ class Faultier:
     def _find_serial_port_linux(self):
         return "/dev/serial/by-id/usb-stacksmashing_Faultier_faultier-if02"
 
-    def _read_response(self):
-        header = self._buffered_read(4)
+    def _read_response(self, timeout=None):
+        header = self._buffered_read(4, timeout)
         if(header[:4] != b"FLTR"):
             raise ValueError(f"Invalid header received: {header}")
-        length_data = self._buffered_read(4)
+        length_data = self._buffered_read(4, timeout)
         length = struct.unpack("<I", length_data)[0]
-        return bytes(self._buffered_read(length))
+        return bytes(self._buffered_read(length, timeout))
 
     def _check_response(self):
         response = self._read_response()
@@ -497,6 +515,108 @@ class Faultier:
         self._send_protobuf(cmd)
         response = self._check_response()
         return convert_uint8_samples(response.adc.samples)
+
+    # STM8 SWIM ---------------------------------------------------------------
+
+    @no_interrupt
+    def _swim_command(self, **fields):
+        if not self.supports_swim:
+            raise SWIMError("This Faultier firmware has no SWIM support, please update it.")
+        cmd = Command()
+        cmd.swim.CopyFrom(CommandSWIM(**fields))
+        self._send_protobuf(cmd)
+        try:
+            response = self._read_response(timeout=SWIM_REPLY_TIMEOUT_MS)
+        except usb.core.USBTimeoutError as e:
+            raise SWIMError(f"No reply from the Faultier within {SWIM_REPLY_TIMEOUT_MS} ms.") from e
+        resp = Response()
+        resp.ParseFromString(response)
+        kind = resp.WhichOneof('type')
+        if kind == 'error':
+            raise SWIMError(resp.error.message)
+        if kind == 'swim':
+            return resp.swim
+        if kind == 'ok':
+            return None
+        raise SWIMError(f"Unexpected reply to a SWIM command: {kind}")
+
+    @staticmethod
+    def _check_swim_range(address, length):
+        if address < 0 or length < 0 or address + length > 0x1000000:
+            raise ValueError(f"SWIM address range 0x{address:X}+{length} is outside the 24-bit address space.")
+
+    def swim_enter(self, hot_attach = False):
+        """
+        Connects to an STM8 over SWIM and enables debug access (SWIM_CSR =
+        0xA0: whole memory range, SRST, internal resets masked). Raises
+        SWIMError if the target does not answer.
+
+        Wiring: SWIM on IO8, NRST on RST of the SWD header, GND, and a pull-up
+        of about 1 kOhm from SWIM to the target's VDD. Faultier pins are 3.3 V
+        only: run the target at 3.3 V or use level shifters on SWIM and NRST.
+
+        :param hot_attach: By default NRST is held low during the entry
+            sequence, which works even if the firmware reuses the SWIM pin, and
+            leaves the core stalled. With hot_attach=True NRST is not touched
+            and the running firmware keeps running; this only works if it has
+            not switched the SWIM pin to GPIO.
+
+        After success, `swim_sync_ns` holds the measured length of the target's
+        synchronisation frame (nominally 16000 ns, i.e. an 8 MHz SWIM clock).
+        """
+        response = self._swim_command(function = SWIM_ENTER, hot_attach = bool(hot_attach))
+        self.swim_sync_ns = response.sync_ns if response is not None else None
+
+    def swim_read(self, address, length):
+        """
+        Reads `length` bytes of target memory starting at the 24-bit
+        `address` (SWIM ROTF) and returns them as bytes. Requires swim_enter().
+        Flash and EEPROM are only readable while the core is stalled (the
+        default after swim_enter()).
+        """
+        address = int(address)
+        length = int(length)
+        self._check_swim_range(address, length)
+        data = bytearray()
+        while len(data) < length:
+            chunk = min(SWIM_MAX_READ, length - len(data))
+            response = self._swim_command(function = SWIM_READ, address = address + len(data), length = chunk)
+            if response is None or len(response.data) != chunk:
+                got = 0 if response is None else len(response.data)
+                raise SWIMError(f"Asked for {chunk} bytes at 0x{address + len(data):06X}, got {got}.")
+            data += response.data
+        return bytes(data)
+
+    def swim_write(self, address, data):
+        """
+        Writes `data` (bytes-like) to target memory starting at the 24-bit
+        `address` (SWIM WOTF, up to 128 bytes per transfer). Requires
+        swim_enter(). This is a raw memory write: RAM and registers take it
+        directly, flash and EEPROM need the target's unlock / programming
+        sequence (FLASH_PUKR, FLASH_DUKR, FLASH_CR2 ...) done through it first.
+        """
+        address = int(address)
+        data = bytes(data)
+        self._check_swim_range(address, len(data))
+        for offset in range(0, len(data), SWIM_MAX_WRITE):
+            chunk = data[offset:offset + SWIM_MAX_WRITE]
+            self._swim_command(function = SWIM_WRITE, address = address + offset, data = chunk)
+
+    def swim_reset(self):
+        """
+        Resets the target with the SWIM SRST command. The SWIM session stays
+        up; the Faultier waits for option byte loading and re-synchronises.
+        """
+        self._swim_command(function = SWIM_SRST)
+
+    def swim_exit(self):
+        """
+        Ends the SWIM session: the target is reset with SWIM switched off so
+        it runs its firmware, and the Faultier releases SWIM and gives NRST
+        back to the SWD probe. The pins are released even if the target does
+        not answer (that is still raised as SWIMError).
+        """
+        self._swim_command(function = SWIM_EXIT)
 
     # @staticmethod
     # def nrf_flash_and_lock():
