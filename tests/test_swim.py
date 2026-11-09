@@ -78,7 +78,7 @@ class FakeFirmware:
             return Response(error=ResponseError(message=message))
         if swim.function == SWIM_ENTER:
             self.active = True
-            return Response(swim=ResponseSWIM(sync_ns=15984))
+            return Response(swim=ResponseSWIM(sync_ns=15984, rise_ns=60))
         if swim.function == SWIM_EXIT:
             self.active = False
             return Response(ok=ResponseOk())
@@ -143,6 +143,17 @@ def test_hot_attach_flag_is_sent():
     assert swim_commands(fw)[0].hot_attach is True
 
 
+def test_entry_tuning_is_sent_and_defaults_to_zero():
+    fw = FakeFirmware()
+    ft = make_faultier(fw)
+    ft.swim_enter()
+    ft.swim_enter(entry_low_us=1000, max_rise_ns=400)
+    first, second = swim_commands(fw)
+    assert (first.entry_low_us, first.max_rise_ns) == (0, 0)
+    assert (second.entry_low_us, second.max_rise_ns) == (1000, 400)
+    assert ft.swim_rise_ns == 60
+
+
 def test_long_read_is_split_and_reassembled():
     fw = FakeFirmware()
     ft = make_faultier(fw)
@@ -173,6 +184,8 @@ def test_largest_command_fits_the_firmware_buffer():
     cmd.swim.length = 0xFFFFFFFF
     cmd.swim.data = b"\xff" * SWIM_MAX_WRITE
     cmd.swim.hot_attach = True
+    cmd.swim.entry_low_us = 0xFFFFFFFF
+    cmd.swim.max_rise_ns = 0xFFFFFFFF
     assert len(cmd.SerializeToString()) <= FIRMWARE_MAX_COMMAND
 
 

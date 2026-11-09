@@ -98,6 +98,7 @@ class Faultier:
     _buffer = b""
     supports_swim = False
     swim_sync_ns = None
+    swim_rise_ns = None
 
     def _buffered_read(self, length, timeout=None):
         while True:
@@ -567,7 +568,7 @@ class Faultier:
         if address < 0 or length < 0 or address + length > 0x1000000:
             raise ValueError(f"SWIM address range 0x{address:X}+{length} is outside the 24-bit address space.")
 
-    def swim_enter(self, hot_attach = False):
+    def swim_enter(self, hot_attach = False, entry_low_us = None, max_rise_ns = None):
         """
         Connects to an STM8 over SWIM and enables debug access (SWIM_CSR =
         0xA0: whole memory range, SRST, internal resets masked). Raises
@@ -583,11 +584,24 @@ class Faultier:
             and the running firmware keeps running; this only works if it has
             not switched the SWIM pin to GPIO.
 
+        :param entry_low_us: Tuning, normally left alone: length of the first
+            low pulse of the entry sequence in microseconds (firmware default
+            16, as in UM0470; at most 10000).
+
+        :param max_rise_ns: Tuning, normally left alone: longest accepted
+            rise time of the released SWIM line before entry gives up on a
+            missing pull-up (firmware default 250 ns, which the bit timing
+            needs).
+
         After success, `swim_sync_ns` holds the measured length of the target's
-        synchronisation frame (nominally 16000 ns, i.e. an 8 MHz SWIM clock).
+        synchronisation frame (nominally 16000 ns, i.e. an 8 MHz SWIM clock) and
+        `swim_rise_ns` the measured rise time of the line.
         """
-        response = self._swim_command(function = SWIM_ENTER, hot_attach = bool(hot_attach))
+        response = self._swim_command(function = SWIM_ENTER, hot_attach = bool(hot_attach),
+                                      entry_low_us = int(entry_low_us or 0),
+                                      max_rise_ns = int(max_rise_ns or 0))
         self.swim_sync_ns = response.sync_ns if response is not None else None
+        self.swim_rise_ns = response.rise_ns if response is not None else None
 
     def swim_read(self, address, length):
         """
