@@ -10,7 +10,7 @@ Non-destructive: reads registers, option bytes and flash, and writes RAM only
 (original contents restored). Never writes flash, EEPROM or option bytes.
 Ends with swim_exit(), so the target runs its firmware again.
 
-Usage: python3 swim_hw_check.py [--flash-size BYTES] [--skip-hot-attach]
+Usage: python3 swim_hw_check.py [--flash-size BYTES] [--skip-hot-attach] [--mux0-power-cycle]
 """
 import argparse
 import sys
@@ -51,6 +51,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--flash-size", type=lambda s: int(s, 0), default=8192)
     parser.add_argument("--skip-hot-attach", action="store_true")
+    parser.add_argument("--mux0-power-cycle", action="store_true",
+                        help="target is powered from MUX0: also power-cycle it during a session")
     args = parser.parse_args()
 
     ft = Faultier()
@@ -75,9 +77,16 @@ def main():
     print(f"       option bytes @4800: {hexdump(opt)}")
     vectors = ft.swim_read(FLASH, 32)
     print(f"       flash @8000: {hexdump(vectors)}")
-    check("vector table at 0x8000 (0x82 every 4 bytes, or erased)",
-          all(b == 0x82 for b in vectors[::4]) or all(b == 0x00 for b in vectors)
-          or all(b == 0xFF for b in vectors))
+    if all(b == 0x71 for b in vectors):
+        # A read-out protected STM8 answers every flash read over SWIM with
+        # 0x71. (ROP is option byte 0x4800: protected unless 0xAA on STM8L,
+        # protected if 0xAA on STM8S.)
+        print(f"       flash reads 0x71: read-out protection is on (ROP byte 0x{opt[0]:02X})")
+        check("flash at 0x8000 readable (read-out protected chip: all 0x71)", True)
+    else:
+        check("vector table at 0x8000 (0x82 every 4 bytes, or erased)",
+              all(b == 0x82 for b in vectors[::4]) or all(b == 0x00 for b in vectors)
+              or all(b == 0xFF for b in vectors))
 
     original = ft.swim_read(RAM_TEST, 16)
     pattern = bytes((0xA5 ^ (i * 0x1D)) & 0xFF for i in range(16))
@@ -111,6 +120,22 @@ def main():
     check("glitch() with no output while SWIM is active, session survives",
           ft.swim_read(SWIM_CSR, 1)[0] & 0x20)
 
+    if args.mux0_power_cycle:
+        # The target is powered from MUX0: a power-cycle "glitch" in the middle
+        # of a session takes SWIM down on the target side.
+        ft.configure_glitcher(power_cycle_output=faultier.OUT_MUX0, power_cycle_length=25_000_000)
+        ft.power_cycle()
+        ft.configure_glitcher(power_cycle_output=faultier.OUT_NONE, power_cycle_length=0)
+        t = time.monotonic()
+        try:
+            ft.swim_read(SWIM_CSR, 1)
+            check("power cycle during a session: next SWIM call raises", False, "no exception")
+        except SWIMError as e:
+            check("power cycle during a session: next SWIM call raises", True,
+                  f"{(time.monotonic() - t) * 1000:.1f} ms, SWIMError({e})")
+        ft.swim_enter()
+        check("swim_enter() again after the power cycle", ft.swim_read(SWIM_CSR, 1)[0] & 0x20)
+
     ft.swim_exit()
     expect_swim_error("read after swim_exit() is refused", lambda: ft.swim_read(SWIM_CSR, 1), "not active")
 
@@ -119,7 +144,7 @@ def main():
         ft.swim_enter(hot_attach=True)
         dm_csr2 = ft.swim_read(DM_CSR2, 1)[0]
         ram = ft.swim_read(0x0000, 16)
-        check("hot attach: running core, RAM readable", True,
+        check("hot attach: RAM readable", True,
               f"STALL={dm_csr2 >> 3 & 1}, RAM@0000: {hexdump(ram)}")
         flash = ft.swim_read(FLASH, 16)
         check("hot attach: flash read matches dump", flash == first[:16], hexdump(flash))

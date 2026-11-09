@@ -586,7 +586,8 @@ class Faultier:
 
         :param entry_low_us: Tuning, normally left alone: length of the first
             low pulse of the entry sequence in microseconds (firmware default
-            16, as in UM0470; at most 10000).
+            1000; UM0470 says 16, which STM8L parts miss about 40 % of the
+            time; at most 10000).
 
         :param max_rise_ns: Tuning, normally left alone: longest accepted
             rise time of the released SWIM line before entry gives up on a

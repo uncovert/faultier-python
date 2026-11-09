@@ -13,3 +13,4 @@ This is the Python documentation for the Faultier library
    :caption: Contents:
 
    faultier
+   swim
